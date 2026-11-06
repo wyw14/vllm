@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from collections import UserDict, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from functools import cached_property, partial
 from itertools import accumulate
 from typing import (
@@ -215,6 +216,154 @@ class PlaceholderRange:
             return self.is_embed is None
 
         return nested_tensors_equal(self.is_embed, other.is_embed)
+
+
+class PlaceholderRangeIssueKind(str, Enum):
+    """Kinds of problems reported by
+    [`diagnose_placeholder_ranges`][vllm.multimodal.inputs.diagnose_placeholder_ranges].
+    """
+
+    NEGATIVE_OFFSET = "negative_offset"
+    NEGATIVE_LENGTH = "negative_length"
+    OUT_OF_BOUNDS = "out_of_bounds"
+    OVERLAP = "overlap"
+    MASK_LENGTH_MISMATCH = "mask_length_mismatch"
+
+
+@dataclass(frozen=True)
+class PlaceholderRangeIssue:
+    """A single problem detected in a list of
+    [`PlaceholderRange`][vllm.multimodal.inputs.PlaceholderRange] objects.
+
+    Attributes:
+        index: Position of the offending range in the input list.
+        kind: Type of the problem.
+        message: Human-readable description of the problem.
+        other_index: For overlaps, the index of the earlier range that
+            the offending range overlaps with; otherwise `None`.
+
+    """
+
+    index: int
+    kind: PlaceholderRangeIssueKind
+    message: str
+    other_index: int | None = None
+
+
+def diagnose_placeholder_ranges(
+    token_total_length: int,
+    ranges: Sequence[PlaceholderRange],
+) -> list[PlaceholderRangeIssue]:
+    """Offline diagnostics for multimodal placeholder ranges.
+
+    This is a pure, read-only check intended for offline use: it inspects
+    only range metadata (`offset`, `length` and the size of `is_embed`),
+    never reads image or embedding payloads, does not mutate `ranges`, and
+    is not invoked from the request processing path.
+
+    Ranges are interpreted as half-open intervals
+    `[offset, offset + length)`. A zero-length interval never overlaps
+    another interval; for example, adjacent intervals `[0, 4)` and
+    `[4, 8)` are not reported as overlapping. Every detected problem is
+    returned, ordered stably by input position: while scanning the ranges
+    in input order, the intrinsic problems of each range (negative
+    offset, negative length, `is_embed` mask length mismatch, out of
+    bounds) are reported first, followed by its overlaps with earlier
+    well-formed ranges in their input order.
+
+    Args:
+        token_total_length: Total number of tokens in the prompt.
+        ranges: Placeholder ranges to diagnose, in input order.
+
+    Returns:
+        All detected problems, ordered by range index and problem kind.
+
+    """
+    issues: list[PlaceholderRangeIssue] = []
+
+    # Indices of ranges that define non-empty, non-negative half-open
+    # intervals; zero-length intervals never participate in overlaps.
+    overlap_candidates: list[int] = []
+
+    for idx, rng in enumerate(ranges):
+        offset = rng.offset
+        length = rng.length
+
+        if offset < 0:
+            issues.append(
+                PlaceholderRangeIssue(
+                    index=idx,
+                    kind=PlaceholderRangeIssueKind.NEGATIVE_OFFSET,
+                    message=(
+                        f"Placeholder range at index {idx} has negative "
+                        f"offset {offset}."
+                    ),
+                )
+            )
+
+        if length < 0:
+            issues.append(
+                PlaceholderRangeIssue(
+                    index=idx,
+                    kind=PlaceholderRangeIssueKind.NEGATIVE_LENGTH,
+                    message=(
+                        f"Placeholder range at index {idx} has negative "
+                        f"length {length}."
+                    ),
+                )
+            )
+        else:
+            if rng.is_embed is not None and len(rng.is_embed) != length:
+                issues.append(
+                    PlaceholderRangeIssue(
+                        index=idx,
+                        kind=PlaceholderRangeIssueKind.MASK_LENGTH_MISMATCH,
+                        message=(
+                            f"Placeholder range at index {idx} has length "
+                            f"{length}, but its is_embed mask has length "
+                            f"{len(rng.is_embed)}."
+                        ),
+                    )
+                )
+
+            end = offset + length
+            if end > token_total_length:
+                issues.append(
+                    PlaceholderRangeIssue(
+                        index=idx,
+                        kind=PlaceholderRangeIssueKind.OUT_OF_BOUNDS,
+                        message=(
+                            f"Placeholder range at index {idx} ends at "
+                            f"{end}, exceeding the total token length "
+                            f"{token_total_length}."
+                        ),
+                    )
+                )
+
+        if offset >= 0 and length > 0:
+            end = offset + length
+            for prev_idx in overlap_candidates:
+                prev = ranges[prev_idx]
+                prev_end = prev.offset + prev.length
+                # Half-open intervals overlap iff both starts lie
+                # strictly before the other's end.
+                if offset < prev_end and prev.offset < end:
+                    issues.append(
+                        PlaceholderRangeIssue(
+                            index=idx,
+                            kind=PlaceholderRangeIssueKind.OVERLAP,
+                            message=(
+                                f"Placeholder range at index {idx} "
+                                f"[{offset}, {end}) overlaps range at "
+                                f"index {prev_idx} "
+                                f"[{prev.offset}, {prev_end})."
+                            ),
+                            other_index=prev_idx,
+                        )
+                    )
+            overlap_candidates.append(idx)
+
+    return issues
 
 
 NestedTensors: TypeAlias = Union[
