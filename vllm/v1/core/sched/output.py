@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
@@ -332,6 +332,172 @@ class SchedulerOutput:
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
         )
+
+    def diagnose_scheduled_token_counts(
+        self,
+    ) -> "ScheduledTokenCountsDiagnostic":
+        """Cross-check the per-request token counts against the scheduled
+        requests, without touching the model or mutating scheduling state.
+
+        Detects:
+          * ``sum(num_scheduled_tokens.values())`` differing from
+            ``total_num_scheduled_tokens``;
+          * requests listed in ``scheduled_new_reqs`` or
+            ``scheduled_cached_reqs`` without a ``num_scheduled_tokens``
+            entry (an explicit ``0`` entry is a present count, not a missing
+            one);
+          * negative per-request counts;
+          * a request id listed in both the new and cached request groups.
+
+        Request order follows ``scheduled_new_reqs`` first, then
+        ``scheduled_cached_reqs.req_ids``. Preempted requests create no
+        expectation on their own: one resumed in the same step appears in one
+        of the two groups, while a preempted-only request legitimately carries
+        no scheduled tokens.
+
+        Returns:
+            A read-only report of the findings; see
+            :class:`ScheduledTokenCountsDiagnostic`.
+
+        """
+        new_req_ids = [req.req_id for req in self.scheduled_new_reqs]
+        cached_req_ids = self.scheduled_cached_reqs.req_ids
+        cached_req_id_set = set(cached_req_ids)
+
+        missing_new_req_ids: list[str] = []
+        missing_cached_req_ids: list[str] = []
+        zero_count_req_ids: list[str] = []
+        negative_counts: dict[str, int] = {}
+        classified: set[str] = set()
+
+        def classify(req_id: str) -> None:
+            if req_id in classified:
+                return
+            classified.add(req_id)
+            count = self.num_scheduled_tokens.get(req_id)
+            if count is None:
+                return
+            if count == 0:
+                zero_count_req_ids.append(req_id)
+            elif count < 0:
+                negative_counts[req_id] = count
+
+        for req_id in new_req_ids:
+            if req_id not in self.num_scheduled_tokens:
+                missing_new_req_ids.append(req_id)
+            classify(req_id)
+        for req_id in cached_req_ids:
+            if req_id not in self.num_scheduled_tokens:
+                missing_cached_req_ids.append(req_id)
+            classify(req_id)
+
+        # Negative counts are never valid, even for ids not listed in either
+        # request group; keep scheduled ids ordered and append the rest.
+        for req_id, count in self.num_scheduled_tokens.items():
+            if req_id not in classified and count < 0:
+                negative_counts[req_id] = count
+
+        duplicated_req_ids = [
+            req_id for req_id in new_req_ids if req_id in cached_req_id_set
+        ]
+        summed_total = sum(self.num_scheduled_tokens.values())
+
+        return ScheduledTokenCountsDiagnostic(
+            declared_total=self.total_num_scheduled_tokens,
+            summed_total=summed_total,
+            missing_new_req_ids=tuple(missing_new_req_ids),
+            missing_cached_req_ids=tuple(missing_cached_req_ids),
+            zero_count_req_ids=tuple(zero_count_req_ids),
+            negative_counts=negative_counts,
+            duplicated_req_ids=tuple(duplicated_req_ids),
+        )
+
+
+@dataclass(frozen=True)
+class ScheduledTokenCountsDiagnostic:
+    """Read-only findings of a SchedulerOutput token-count consistency check.
+
+    All request-id sequences preserve the original scheduling order (new
+    requests first, then cached requests).
+
+    Args:
+        declared_total: Value of ``total_num_scheduled_tokens`` in the output.
+        summed_total: Sum of the per-request ``num_scheduled_tokens``.
+        missing_new_req_ids: New requests without a per-request count entry.
+        missing_cached_req_ids: Cached requests without a count entry.
+        zero_count_req_ids: Scheduled requests whose count entry is exactly 0
+            (present, as opposed to missing).
+        negative_counts: Requests with a negative count and the count value.
+        duplicated_req_ids: Request ids present in both the new and cached
+            request groups.
+
+    """
+
+    declared_total: int
+    summed_total: int
+    missing_new_req_ids: tuple[str, ...]
+    missing_cached_req_ids: tuple[str, ...]
+    zero_count_req_ids: tuple[str, ...]
+    negative_counts: Mapping[str, int]
+    duplicated_req_ids: tuple[str, ...]
+
+    @property
+    def total_mismatch(self) -> int:
+        """Declared total minus the sum of the per-request counts."""
+        return self.declared_total - self.summed_total
+
+    @property
+    def is_consistent(self) -> bool:
+        """Whether no inconsistency was found (zero counts are allowed)."""
+        return (
+            self.total_mismatch == 0
+            and not self.missing_new_req_ids
+            and not self.missing_cached_req_ids
+            and not self.negative_counts
+            and not self.duplicated_req_ids
+        )
+
+    def format_report(self) -> str:
+        """Render a human-readable description of the findings."""
+        if self.is_consistent:
+            return (
+                "SchedulerOutput scheduled-token counts are consistent "
+                f"(sum of per-request counts = {self.summed_total})."
+            )
+        lines = ["SchedulerOutput scheduled-token counts are inconsistent:"]
+        if self.total_mismatch != 0:
+            lines.append(
+                f"  total_num_scheduled_tokens={self.declared_total} but "
+                f"sum(num_scheduled_tokens)={self.summed_total} "
+                f"(difference {self.total_mismatch:+d})"
+            )
+        if self.missing_new_req_ids:
+            lines.append(
+                f"  new requests missing a count: {list(self.missing_new_req_ids)}"
+            )
+        if self.missing_cached_req_ids:
+            lines.append(
+                "  cached requests missing a count: "
+                f"{list(self.missing_cached_req_ids)}"
+            )
+        if self.negative_counts:
+            lines.append(
+                f"  requests with negative counts: {dict(self.negative_counts)}"
+            )
+        if self.duplicated_req_ids:
+            lines.append(
+                "  requests present in both the new and cached groups: "
+                f"{list(self.duplicated_req_ids)}"
+            )
+        if self.zero_count_req_ids:
+            lines.append(
+                "  requests with an explicit zero count (present, not "
+                f"missing): {list(self.zero_count_req_ids)}"
+            )
+        return "\n".join(lines)
+
+    def __str__(self) -> str:
+        return self.format_report()
 
 
 @dataclass
