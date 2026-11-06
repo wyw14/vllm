@@ -8,7 +8,7 @@ import math
 from dataclasses import field
 from enum import Enum, IntEnum
 from functools import cached_property
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, NamedTuple
 
 import msgspec
 import numpy as np
@@ -1494,6 +1494,158 @@ class SamplingParams(
             prompt_logprobs=1,
             watermarking=True,
         )
+
+
+class SamplingParamsNormalization(NamedTuple):
+    """A field rewritten while constructing :class:`SamplingParams`.
+
+    Only the field name and the reason are captured; normalized values are
+    intentionally omitted so an offline preview can never echo stop text
+    or token IDs supplied by the caller.
+    """
+
+    field: str
+    reason: str
+
+
+# Fields rewritten by SamplingParams.__post_init__, in application order.
+# Fields the caller did not pass (i.e. values left at their defaults) are
+# never reported.
+_NORMALIZED_FIELDS: tuple[str, ...] = (
+    "temperature",
+    "seed",
+    "thinking_token_budget",
+    "stop",
+    "stop_token_ids",
+    "bad_words",
+    "logprobs",
+    "prompt_logprobs",
+    "top_p",
+    "top_k",
+    "min_p",
+    "skip_reading_prefix_cache",
+)
+
+
+def _normalization_reason(name: str, before: Any, after: Any) -> str:
+    """Static, value-free explanation for why ``name`` was normalized."""
+    if name == "temperature":
+        return (
+            f"a positive temperature below {_MAX_TEMP} is raised to "
+            f"{_MAX_TEMP} to avoid numerical instability (nan or inf)"
+        )
+    if name == "seed":
+        return "seed -1 means unseeded sampling and is normalized to None"
+    if name == "thinking_token_budget":
+        return "-1 means an unlimited thinking budget and is normalized to None"
+    if name == "stop":
+        if isinstance(before, str):
+            return "a single stop string is wrapped in a one-element list"
+        return "an unset stop is normalized to an empty list"
+    if name in ("stop_token_ids", "bad_words"):
+        if before is None:
+            return f"an unset {name} is normalized to an empty list"
+        if len(before) != len(after):
+            return f"duplicate {name} entries are removed, keeping first-seen order"
+    if name == "logprobs":
+        return "logprobs=True is normalized to 1 (one top log probability)"
+    if name == "prompt_logprobs":
+        return "prompt_logprobs=True is normalized to 1"
+    if name == "top_p":
+        return (
+            f"temperature below {_SAMPLING_EPS} selects greedy sampling; "
+            "top_p is reset to 1.0"
+        )
+    if name == "top_k":
+        return (
+            f"temperature below {_SAMPLING_EPS} selects greedy sampling; "
+            "top_k is reset to 0 (disabled)"
+        )
+    if name == "min_p":
+        return (
+            f"temperature below {_SAMPLING_EPS} selects greedy sampling; "
+            "min_p is reset to 0.0 (disabled)"
+        )
+    if name == "skip_reading_prefix_cache":
+        return (
+            "defaults to whether prompt logprobs are requested when not set explicitly"
+        )
+    return "normalized while constructing SamplingParams"
+
+
+def _normalized_values_differ(before: Any, after: Any) -> bool:
+    """Whether construction normalized ``before`` into ``after``.
+
+    Booleans are kept distinct from ints (``logprobs=True`` -> ``1`` is a
+    change), while ints compare numerically to floats (``temperature=0``
+    -> ``0.0`` is not a change).
+    """
+    if isinstance(before, np.ndarray) or isinstance(after, np.ndarray):
+        return not (
+            isinstance(before, np.ndarray)
+            and isinstance(after, np.ndarray)
+            and before.shape == after.shape
+            and np.array_equal(before, after)
+        )
+    if (
+        isinstance(before, (int, float))
+        and not isinstance(before, bool)
+        and isinstance(after, (int, float))
+        and not isinstance(after, bool)
+    ):
+        return before != after
+    if type(before) is not type(after):
+        return True
+    return before != after
+
+
+def preview_sampling_params_normalization(
+    **kwargs: Any,
+) -> list[SamplingParamsNormalization]:
+    """Offline preview of the normalizations applied to SamplingParams.
+
+    Constructs ``SamplingParams`` from private copies of ``kwargs`` without
+    starting an engine or tokenizer, and reports every provided field whose
+    value construction rewrites (wrapping a stop string in a list,
+    deduplicating stop_token_ids, clearing seed -1, or resetting
+    top_p/top_k/min_p for near-zero-temperature greedy decoding, among
+    others). The caller's arguments are never modified, and reports contain
+    field names and reasons only -- never stop text or token values.
+
+    Args:
+        **kwargs: The same keyword arguments as ``SamplingParams(...)``.
+
+    Returns:
+        One entry per provided field whose normalized value differs from
+        the input, ordered as the normalizations apply in ``__post_init__``.
+        Fields left at their defaults are not reported.
+
+    Raises:
+        Any exception raised by ``SamplingParams(**kwargs)``, unchanged;
+        invalid arguments surface the same VLLMValidationError or
+        TypeError as direct construction.
+
+    """
+    # Build from a private copy and diff against a separate pristine
+    # snapshot, so the caller's arguments can never be mutated (now or if
+    # __post_init__ starts normalizing containers in place).
+    snapshot = copy.deepcopy(kwargs)
+    params = SamplingParams(**copy.deepcopy(kwargs))
+
+    extra_fields = sorted(set(kwargs) - set(_NORMALIZED_FIELDS))
+    changes: list[SamplingParamsNormalization] = []
+    for name in (*_NORMALIZED_FIELDS, *extra_fields):
+        if name not in snapshot:
+            continue
+        before = snapshot[name]
+        after = getattr(params, name)
+        if _normalized_values_differ(before, after):
+            changes.append(
+                SamplingParamsNormalization(
+                    name, _normalization_reason(name, before, after)
+                )
+            )
+    return changes
 
 
 class BeamSearchParams(

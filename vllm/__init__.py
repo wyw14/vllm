@@ -25,6 +25,9 @@ MODULE_ATTRS = {
     "TokensPrompt": ".inputs:TokensPrompt",
     "ModelRegistry": ".model_executor.models:ModelRegistry",
     "SamplingParams": ".sampling_params:SamplingParams",
+    "preview_sampling_params_normalization": (
+        ".sampling_params:preview_sampling_params_normalization"
+    ),
     "PoolingParams": ".pooling_params:PoolingParams",
     "ClassificationOutput": ".outputs:ClassificationOutput",
     "ClassificationRequestOutput": ".outputs:ClassificationRequestOutput",
@@ -58,7 +61,10 @@ if typing.TYPE_CHECKING:
         ScoringRequestOutput,
     )
     from vllm.pooling_params import PoolingParams
-    from vllm.sampling_params import SamplingParams
+    from vllm.sampling_params import (
+        SamplingParams,
+        preview_sampling_params_normalization,
+    )
     from vllm.v1.executor.ray_utils import initialize_ray_cluster
 else:
 
@@ -82,6 +88,7 @@ __all__ = [
     "TextPrompt",
     "TokensPrompt",
     "SamplingParams",
+    "preview_sampling_params_normalization",
     "RequestOutput",
     "CompletionOutput",
     "PoolingOutput",

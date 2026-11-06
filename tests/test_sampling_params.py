@@ -8,8 +8,17 @@ import pytest
 from vllm import SamplingParams
 from vllm.config.diffusion import DiffusionConfig
 from vllm.exceptions import VLLMValidationError
+from vllm.sampling_params import (
+    _MAX_TEMP,
+    _SAMPLING_EPS,
+    preview_sampling_params_normalization,
+)
 from vllm.utils.diffusion import validate_diffusion_sampling_params
 from vllm.v1.engine.input_processor import InputProcessor
+
+
+def preview(**kwargs):
+    return preview_sampling_params_normalization(**kwargs)
 
 
 @dataclass
@@ -280,3 +289,180 @@ def test_extra_args_preserves_custom_objects_and_shared_containers():
     params = SamplingParams(extra_args=extra_args)
     assert params.extra_args["first"][0] is custom
     assert params.extra_args["first"] is params.extra_args["second"]
+
+
+def test_preview_with_empty_args_reports_nothing():
+    assert preview() == []
+    # Explicit empty containers are already in their normalized form.
+    assert preview(stop=[]) == []
+    assert preview(stop_token_ids=[]) == []
+    assert preview(bad_words=[]) == []
+
+
+def test_preview_wraps_stop_string_without_echoing_text():
+    secret = "SECRET-STOP-VALUE"
+    changes = preview(stop=secret)
+    assert [change.field for change in changes] == ["stop"]
+    assert "list" in changes[0].reason
+    assert secret not in repr(changes)
+    assert SamplingParams(stop=secret).stop == [secret]
+    # An already-normalized list is left alone.
+    assert preview(stop=["a", "b"]) == []
+    # An explicit None is normalized to an empty list.
+    (change,) = preview(stop=None)
+    assert change.field == "stop"
+
+
+def test_preview_deduplicates_stop_token_ids_without_echoing_ids():
+    ids = [11, 22, 11, 22, 11]
+    changes = preview(stop_token_ids=ids)
+    assert [change.field for change in changes] == ["stop_token_ids"]
+    assert "duplicate" in changes[0].reason
+    assert "11" not in repr(changes)
+    assert "22" not in repr(changes)
+    # The preview agrees with direct construction.
+    assert SamplingParams(stop_token_ids=ids).stop_token_ids == [11, 22]
+    # Unique values and the original input are left untouched.
+    assert preview(stop_token_ids=[1, 2]) == []
+    assert ids == [11, 22, 11, 22, 11]
+
+
+def test_preview_deduplicates_bad_words():
+    secret = "SECRET-BAD-WORD"
+    changes = preview(bad_words=[secret, secret])
+    assert [change.field for change in changes] == ["bad_words"]
+    assert "duplicate" in changes[0].reason
+    assert secret not in repr(changes)
+
+
+def test_preview_clears_seed_minus_one():
+    changes = preview(seed=-1)
+    assert [change.field for change in changes] == ["seed"]
+    assert SamplingParams(seed=-1).seed is None
+    assert preview(seed=42) == []
+
+
+def test_preview_greedy_resets_sampling_options():
+    changes = preview(temperature=0.0, top_p=0.5, top_k=10, min_p=0.2)
+    assert [change.field for change in changes] == ["top_p", "top_k", "min_p"]
+    assert all("greedy" in change.reason for change in changes)
+    # temperature itself is not rewritten at exactly zero.
+    assert SamplingParams(temperature=0.0).temperature == 0.0
+    # Defaults already match the greedy reset, so nothing is reported.
+    assert preview(temperature=0.0) == []
+    # Only non-default options surface.
+    (change,) = preview(temperature=0.0, top_k=10)
+    assert change.field == "top_k"
+
+
+@pytest.mark.parametrize(
+    ("temperature", "expected_fields"),
+    [
+        (0.0, []),  # exact zero selects greedy without a rewrite
+        (_SAMPLING_EPS / 2, ["temperature"]),  # raised to the floor
+        (_SAMPLING_EPS, ["temperature"]),  # below the floor -> raised
+        (_MAX_TEMP / 2, ["temperature"]),
+        (_MAX_TEMP - 1e-12, ["temperature"]),
+        (_MAX_TEMP, []),  # exactly the floor is untouched
+        (0.5, []),
+        (1.0, []),
+        (2.0, []),  # upper bound is inclusive
+    ],
+)
+def test_preview_temperature_boundaries(temperature, expected_fields):
+    changes = preview(temperature=temperature)
+    assert [change.field for change in changes] == expected_fields
+    params = SamplingParams(temperature=temperature)
+    if expected_fields:
+        assert params.temperature == _MAX_TEMP
+    else:
+        assert params.temperature == temperature
+
+
+def test_preview_reports_changes_in_post_init_order():
+    changes = preview(
+        temperature=0.0,
+        seed=-1,
+        stop="x",
+        stop_token_ids=[1, 1],
+        top_p=0.5,
+    )
+    assert [change.field for change in changes] == [
+        "seed",
+        "stop",
+        "stop_token_ids",
+        "top_p",
+    ]
+
+
+def test_preview_does_not_mutate_caller_input():
+    ids = [3, 3, 7]
+    words = ["dup", "dup"]
+    changes = preview(
+        stop=["keep"],
+        stop_token_ids=ids,
+        bad_words=words,
+        seed=-1,
+        temperature=0.0,
+        top_p=0.5,
+    )
+    assert {change.field for change in changes} == {
+        "stop_token_ids",
+        "bad_words",
+        "seed",
+        "top_p",
+    }
+    assert ids == [3, 3, 7]
+    assert words == ["dup", "dup"]
+
+
+def test_preview_never_reports_values():
+    secret_stop = "SECRET-STOP-VALUE-42"
+    changes = preview(
+        stop=secret_stop,
+        stop_token_ids=[424242, 424242, 777777],
+        bad_words=["SECRET-BAD-WORD", "SECRET-BAD-WORD"],
+        seed=-1,
+        temperature=1e-3,
+    )
+    rendered = "\n".join(f"{change.field}:{change.reason}" for change in changes)
+    assert secret_stop not in rendered
+    assert "424242" not in rendered
+    assert "777777" not in rendered
+    assert "SECRET-BAD-WORD" not in rendered
+    assert {change.field for change in changes} == {
+        "temperature",
+        "seed",
+        "stop",
+        "stop_token_ids",
+        "bad_words",
+    }
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"temperature": -0.1},
+        {"temperature": 2.000001},
+        {"temperature": float("inf")},
+        {"temperature": float("nan")},
+        {"top_p": 0.0},
+        {"n": 0},
+        {"max_tokens": 0},
+        {"stop": [""]},
+        {"stop_token_ids": [1, "x"]},
+        {"bad_words": [""]},
+        {"thinking_token_budget": 1.5},
+        {"thinking_token_budget": True},
+        {"top_k": -2},
+        {"min_p": 1.5},
+        {"logprobs": -2},
+        {"repetition_penalty": 0.0},
+        {"no_such_field": 1},
+    ],
+)
+def test_preview_invalid_args_raise_existing_errors(kwargs):
+    with pytest.raises(Exception) as direct:
+        SamplingParams(**kwargs)
+    with pytest.raises(type(direct.value)):
+        preview(**kwargs)
