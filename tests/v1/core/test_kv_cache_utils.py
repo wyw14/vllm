@@ -47,6 +47,7 @@ from vllm.v1.core.kv_cache_planning import (
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     FreeKVCacheBlockQueue,
+    FreeQueueIntegrityErrorKind,
     KVCacheBlock,
     generate_block_hash_extra_keys,
     generate_scheduler_kv_cache_config,
@@ -766,6 +767,224 @@ def test_free_kv_cache_block_queue_get_all_free_blocks():
     # Append a block back and check again
     queue.append(block_to_remove)
     assert queue.get_all_free_blocks() == blocks[1:2] + blocks[3:] + [block_to_remove]
+
+
+def _snapshot_free_queue_links(
+    queue: FreeKVCacheBlockQueue, blocks: list[KVCacheBlock]
+) -> tuple:
+    """All prev/next links plus the counter, for read-only assertions."""
+    return (
+        (
+            queue.fake_free_list_head.prev_free_block,
+            queue.fake_free_list_head.next_free_block,
+        ),
+        [(block.prev_free_block, block.next_free_block) for block in blocks],
+        (
+            queue.fake_free_list_tail.prev_free_block,
+            queue.fake_free_list_tail.next_free_block,
+        ),
+        queue.num_free_blocks,
+    )
+
+
+@pytest.mark.parametrize("num_blocks", [0, 1, 5])
+def test_free_kv_cache_block_queue_check_integrity_valid(num_blocks):
+    # Covers the empty queue and the single-block queue, plus a larger one.
+    blocks = [KVCacheBlock(block_id=i) for i in range(num_blocks)]
+    queue = FreeKVCacheBlockQueue(blocks)
+    links_before = _snapshot_free_queue_links(queue, blocks)
+
+    report = queue.check_integrity()
+
+    assert report.ok
+    assert report.issues == []
+    assert report.reached_tail
+    assert report.num_free_blocks == num_blocks
+    assert report.num_traversed_blocks == num_blocks
+    # Read-only: no links or the counter changed, eviction order is intact.
+    assert _snapshot_free_queue_links(queue, blocks) == links_before
+    assert queue.get_all_free_blocks() == blocks
+
+
+def test_free_kv_cache_block_queue_check_integrity_after_operations():
+    blocks = [KVCacheBlock(block_id=i) for i in range(5)]
+    queue = FreeKVCacheBlockQueue(blocks)
+
+    queue.popleft()
+    block_to_remove = blocks[2]
+    queue.remove(block_to_remove)
+    queue.append(block_to_remove)
+
+    report = queue.check_integrity()
+    assert report.ok
+    assert report.reached_tail
+    assert report.num_free_blocks == 4
+    assert report.num_traversed_blocks == 4
+    assert queue.get_all_free_blocks() == blocks[1:2] + blocks[3:] + [block_to_remove]
+
+
+@pytest.mark.parametrize(
+    "corruption,cycle_block_id,num_traversed",
+    [
+        # Last block loops back to the first block.
+        ("tail_to_head", 0, 3),
+        # Block loops back to itself.
+        ("self_loop", 1, 2),
+        # Block loops back to the fake head sentinel.
+        ("back_to_sentinel", -1, 2),
+    ],
+)
+def test_free_kv_cache_block_queue_check_integrity_detects_cycle(
+    corruption, cycle_block_id, num_traversed
+):
+    blocks = [KVCacheBlock(block_id=i) for i in range(3)]
+    queue = FreeKVCacheBlockQueue(blocks)
+    if corruption == "tail_to_head":
+        blocks[2].next_free_block = blocks[0]
+    elif corruption == "self_loop":
+        blocks[1].next_free_block = blocks[1]
+    else:
+        blocks[1].next_free_block = queue.fake_free_list_head
+    links_before = _snapshot_free_queue_links(queue, blocks)
+
+    # Must terminate (stop at the cycle) instead of looping forever.
+    report = queue.check_integrity()
+
+    assert [issue.kind for issue in report.issues] == [
+        FreeQueueIntegrityErrorKind.CYCLE
+    ]
+    assert report.issues[0].block_id == cycle_block_id
+    assert not report.reached_tail
+    assert report.num_traversed_blocks == num_traversed
+    # Traversal was cut short, so the count is not judged; the first
+    # fabricated cycle happens to keep num_free_blocks == traversed count.
+    assert report.num_free_blocks == 3
+    # Read-only: the fabricated links and eviction order are untouched.
+    assert _snapshot_free_queue_links(queue, blocks) == links_before
+    assert queue.num_free_blocks == 3
+
+
+@pytest.mark.parametrize(
+    "num_blocks,corrupt_block_id,broken_block_id,num_traversed",
+    [
+        # A real block in the middle loses its next link.
+        (3, 1, 1, 2),
+        # Fake head loses its outgoing link while blocks still exist.
+        (3, -1, -1, 0),
+        # Empty queue whose head was detached from the tail.
+        (0, -1, -1, 0),
+    ],
+)
+def test_free_kv_cache_block_queue_check_integrity_detects_broken_link(
+    num_blocks, corrupt_block_id, broken_block_id, num_traversed
+):
+    blocks = [KVCacheBlock(block_id=i) for i in range(num_blocks)]
+    queue = FreeKVCacheBlockQueue(blocks)
+    if corrupt_block_id == -1:
+        queue.fake_free_list_head.next_free_block = None
+    else:
+        blocks[corrupt_block_id].next_free_block = None
+    links_before = _snapshot_free_queue_links(queue, blocks)
+
+    report = queue.check_integrity()
+
+    assert [issue.kind for issue in report.issues] == [
+        FreeQueueIntegrityErrorKind.BROKEN_LINK
+    ]
+    assert report.issues[0].block_id == broken_block_id
+    assert not report.reached_tail
+    assert report.num_traversed_blocks == num_traversed
+    assert _snapshot_free_queue_links(queue, blocks) == links_before
+
+
+@pytest.mark.parametrize(
+    "corruption,bad_block_id",
+    [
+        # prev pointer of a real block points at the wrong block.
+        ("wrong_prev", 1),
+        # prev pointer of a real block is missing.
+        ("none_prev", 0),
+        # Fake tail's back-link points at the wrong block.
+        ("wrong_tail_prev", -1),
+    ],
+)
+def test_free_kv_cache_block_queue_check_integrity_detects_inconsistent_link(
+    corruption, bad_block_id
+):
+    blocks = [KVCacheBlock(block_id=i) for i in range(3)]
+    queue = FreeKVCacheBlockQueue(blocks)
+    if corruption == "wrong_prev":
+        blocks[1].prev_free_block = blocks[2]
+    elif corruption == "none_prev":
+        blocks[0].prev_free_block = None
+    else:
+        queue.fake_free_list_tail.prev_free_block = blocks[0]
+    links_before = _snapshot_free_queue_links(queue, blocks)
+
+    report = queue.check_integrity()
+
+    assert [issue.kind for issue in report.issues] == [
+        FreeQueueIntegrityErrorKind.INCONSISTENT_LINK
+    ]
+    assert report.issues[0].block_id == bad_block_id
+    assert report.reached_tail
+    assert report.num_traversed_blocks == 3
+    assert report.num_free_blocks == 3
+    assert _snapshot_free_queue_links(queue, blocks) == links_before
+
+
+@pytest.mark.parametrize("fake_count", [2, 7])
+def test_free_kv_cache_block_queue_check_integrity_detects_count_mismatch(
+    fake_count,
+):
+    blocks = [KVCacheBlock(block_id=i) for i in range(5)]
+    queue = FreeKVCacheBlockQueue(blocks)
+    # Desync only the counter; the linked list itself is intact.
+    queue.num_free_blocks = fake_count
+    links_before = _snapshot_free_queue_links(queue, blocks)
+
+    report = queue.check_integrity()
+
+    assert [issue.kind for issue in report.issues] == [
+        FreeQueueIntegrityErrorKind.COUNT_MISMATCH
+    ]
+    assert report.issues[0].block_id is None
+    assert report.reached_tail
+    assert report.num_traversed_blocks == 5
+    assert report.num_free_blocks == fake_count
+    assert str(5) in report.issues[0].message
+    assert str(fake_count) in report.issues[0].message
+    assert _snapshot_free_queue_links(queue, blocks) == links_before
+
+
+def test_free_kv_cache_block_queue_check_integrity_empty_queue_count_mismatch():
+    queue = FreeKVCacheBlockQueue([])
+    queue.num_free_blocks = 1
+
+    report = queue.check_integrity()
+
+    assert [issue.kind for issue in report.issues] == [
+        FreeQueueIntegrityErrorKind.COUNT_MISMATCH
+    ]
+    assert report.reached_tail
+    assert report.num_traversed_blocks == 0
+
+
+def test_free_kv_cache_block_queue_check_integrity_reports_multiple_issues():
+    # A bad back-link and a desynced counter are reported together.
+    blocks = [KVCacheBlock(block_id=i) for i in range(3)]
+    queue = FreeKVCacheBlockQueue(blocks)
+    blocks[1].prev_free_block = blocks[2]
+    queue.num_free_blocks = 9
+
+    report = queue.check_integrity()
+
+    assert [issue.kind for issue in report.issues] == [
+        FreeQueueIntegrityErrorKind.INCONSISTENT_LINK,
+        FreeQueueIntegrityErrorKind.COUNT_MISMATCH,
+    ]
+    assert report.reached_tail
+    assert report.num_traversed_blocks == 3
 
 
 def test_generate_block_hash_extra_keys():

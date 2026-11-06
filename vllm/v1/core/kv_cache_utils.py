@@ -8,6 +8,7 @@ import math
 import os
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -255,6 +256,52 @@ def trim_null_head(blocks: _BlockSeq) -> _BlockSeq:
 class KVCacheBlockCopy(NamedTuple):
     src_block_id: int
     dst_block_id: int
+
+
+class FreeQueueIntegrityErrorKind(Enum):
+    """Integrity violations detectable in a free-block doubly linked list."""
+
+    # A node was reached again while following next_free_block links.
+    CYCLE = "cycle"
+    # next_free_block was None before reaching the fake tail.
+    BROKEN_LINK = "broken_link"
+    # A node's prev_free_block does not point back to its predecessor.
+    INCONSISTENT_LINK = "inconsistent_link"
+    # Number of traversed real blocks differs from num_free_blocks.
+    COUNT_MISMATCH = "count_mismatch"
+
+
+@dataclass(slots=True)
+class FreeQueueIntegrityIssue:
+    """One integrity violation found in a FreeKVCacheBlockQueue."""
+
+    kind: FreeQueueIntegrityErrorKind
+    message: str
+    # Block id where the violation was observed; -1 for a sentinel, None
+    # when no specific block is involved (e.g. count mismatch).
+    block_id: int | None = None
+
+
+@dataclass(slots=True)
+class FreeQueueIntegrityReport:
+    """Result of FreeKVCacheBlockQueue.check_integrity().
+
+    The check is read-only: it never adds or removes blocks and never
+    changes the eviction order.
+    """
+
+    # The queue's num_free_blocks counter.
+    num_free_blocks: int
+    # Real (non-sentinel) blocks reached before traversal stopped.
+    num_traversed_blocks: int
+    # Whether the fake tail was reached; False when a cycle or a broken
+    # link cut the traversal short.
+    reached_tail: bool
+    issues: list[FreeQueueIntegrityIssue]
+
+    @property
+    def ok(self) -> bool:
+        return not self.issues
 
 
 class FreeKVCacheBlockQueue:
@@ -519,6 +566,126 @@ class FreeKVCacheBlockQueue:
         while curr_block is not None and curr_block is not self.fake_free_list_tail:
             yield curr_block
             curr_block = curr_block.next_free_block
+
+    def check_integrity(self) -> FreeQueueIntegrityReport:
+        """Check the integrity of the free-block doubly linked list.
+
+        Traverses ``next_free_block`` links from the fake head to the fake
+        tail without modifying the queue and reports:
+
+        * cycles: a node reached again; traversal stops immediately,
+        * broken links: ``next_free_block`` is None before the fake tail,
+        * inconsistent links: a node's ``prev_free_block`` does not point
+          back to its predecessor,
+        * count mismatch: traversed block count != ``num_free_blocks``.
+
+        The count is only compared when the fake tail is reached, since a
+        cycle or broken link makes the true block count unknowable.
+
+        Returns:
+            A FreeQueueIntegrityReport describing every issue found.
+
+        """
+        head = self.fake_free_list_head
+        tail = self.fake_free_list_tail
+
+        issues: list[FreeQueueIntegrityIssue] = []
+        # KVCacheBlock is unhashable, so track visited nodes by id(). The
+        # fake head is pre-seeded so a link back into it is a cycle too.
+        seen_ids: set[int] = {id(head)}
+        prev_block = head
+        curr_block = head.next_free_block
+        num_traversed_blocks = 0
+        reached_tail = False
+
+        while True:
+            if curr_block is None:
+                issues.append(
+                    FreeQueueIntegrityIssue(
+                        kind=FreeQueueIntegrityErrorKind.BROKEN_LINK,
+                        message=(
+                            f"Block {prev_block.block_id} has "
+                            "next_free_block=None before reaching the fake tail"
+                        ),
+                        block_id=prev_block.block_id,
+                    )
+                )
+                break
+
+            if id(curr_block) in seen_ids:
+                issues.append(
+                    FreeQueueIntegrityIssue(
+                        kind=FreeQueueIntegrityErrorKind.CYCLE,
+                        message=(
+                            f"Cycle detected at block {curr_block.block_id}; "
+                            "stopping traversal"
+                        ),
+                        block_id=curr_block.block_id,
+                    )
+                )
+                break
+
+            if curr_block is tail:
+                if tail.prev_free_block is not prev_block:
+                    actual_prev_id = (
+                        tail.prev_free_block.block_id
+                        if tail.prev_free_block is not None
+                        else None
+                    )
+                    issues.append(
+                        FreeQueueIntegrityIssue(
+                            kind=FreeQueueIntegrityErrorKind.INCONSISTENT_LINK,
+                            message=(
+                                "fake_free_list_tail.prev_free_block is "
+                                f"{actual_prev_id} but should be "
+                                f"{prev_block.block_id}"
+                            ),
+                            block_id=tail.block_id,
+                        )
+                    )
+                reached_tail = True
+                break
+
+            seen_ids.add(id(curr_block))
+            if curr_block.prev_free_block is not prev_block:
+                actual_prev_id = (
+                    curr_block.prev_free_block.block_id
+                    if curr_block.prev_free_block is not None
+                    else None
+                )
+                issues.append(
+                    FreeQueueIntegrityIssue(
+                        kind=FreeQueueIntegrityErrorKind.INCONSISTENT_LINK,
+                        message=(
+                            f"Block {curr_block.block_id}.prev_free_block is "
+                            f"{actual_prev_id} but should be "
+                            f"{prev_block.block_id}"
+                        ),
+                        block_id=curr_block.block_id,
+                    )
+                )
+
+            num_traversed_blocks += 1
+            prev_block = curr_block
+            curr_block = curr_block.next_free_block
+
+        if reached_tail and num_traversed_blocks != self.num_free_blocks:
+            issues.append(
+                FreeQueueIntegrityIssue(
+                    kind=FreeQueueIntegrityErrorKind.COUNT_MISMATCH,
+                    message=(
+                        f"Free list contains {num_traversed_blocks} blocks but "
+                        f"num_free_blocks is {self.num_free_blocks}"
+                    ),
+                )
+            )
+
+        return FreeQueueIntegrityReport(
+            num_free_blocks=self.num_free_blocks,
+            num_traversed_blocks=num_traversed_blocks,
+            reached_tail=reached_tail,
+            issues=issues,
+        )
 
 
 def _gen_mm_extra_hash_keys(
