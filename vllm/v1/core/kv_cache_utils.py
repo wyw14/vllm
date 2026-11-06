@@ -6,8 +6,10 @@ import copy
 import hashlib
 import math
 import os
+from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -704,6 +706,144 @@ def to_event_extra_keys(
         for keys in extra_keys
     ]
     return event_keys or None
+
+
+class ExtraKeyDiffStatus(str, Enum):
+    """Per-category result of comparing two block-hash extra-key sets.
+
+    EQUAL: the category is absent on both sides or has identical entries.
+    MISSING_LEFT: the category only appears in the right-hand keys.
+    MISSING_RIGHT: the category only appears in the left-hand keys.
+    NOT_EQUAL: the category appears on both sides but its entries differ.
+    """
+
+    EQUAL = "equal"
+    MISSING_LEFT = "missing_left"
+    MISSING_RIGHT = "missing_right"
+    NOT_EQUAL = "not_equal"
+
+
+# Maps the public category name in ``ExtraKeysDiff`` to the tag carried by
+# entries produced by ``generate_block_hash_extra_keys``.
+_EXTRA_KEY_CATEGORIES: tuple[tuple[str, str], ...] = (
+    ("multimodal", "mm"),
+    ("lora", "lora"),
+    ("cache_salt", "cache_salt"),
+    ("prompt_embeds", "prompt_embeds"),
+)
+
+
+@dataclass(frozen=True)
+class ExtraKeysDiff:
+    """Category-by-category explanation of how two extra-key sets differ.
+
+    Only comparison statuses are exposed; raw key payloads (LoRA name/path,
+    multimodal identifiers and offsets, cache salt, and prompt-embedding
+    digests) are never included, so the result is safe to log.
+    """
+
+    multimodal: ExtraKeyDiffStatus
+    lora: ExtraKeyDiffStatus
+    cache_salt: ExtraKeyDiffStatus
+    prompt_embeds: ExtraKeyDiffStatus
+
+    @property
+    def is_equal(self) -> bool:
+        """Whether every category matches, including absent on both sides."""
+        return all(
+            getattr(self, name) is ExtraKeyDiffStatus.EQUAL
+            for name, _ in _EXTRA_KEY_CATEGORIES
+        )
+
+    @property
+    def changed_categories(self) -> tuple[str, ...]:
+        """Names of categories missing on one side or unequal across both."""
+        return tuple(
+            name
+            for name, _ in _EXTRA_KEY_CATEGORIES
+            if getattr(self, name) is not ExtraKeyDiffStatus.EQUAL
+        )
+
+    def explain(self) -> tuple[str, ...]:
+        """One ``'<category>: <status>'`` string per changed category."""
+        return tuple(
+            f"{name}: {getattr(self, name).value}" for name in self.changed_categories
+        )
+
+    def __str__(self) -> str:
+        changes = self.explain()
+        return "; ".join(changes) if changes else "all extra-key categories match"
+
+
+def _group_extra_keys_by_category(
+    extra_keys: tuple[Any, ...] | None,
+) -> dict[str, tuple[tuple[Any, ...], ...]]:
+    """Split generated extra keys into per-category entry tuples."""
+    groups: dict[str, list[tuple[Any, ...]]] = {
+        tag: [] for _, tag in _EXTRA_KEY_CATEGORIES
+    }
+    if extra_keys is not None:
+        for entry in extra_keys:
+            tag = entry[0]
+            if tag not in groups:
+                raise ValueError(f"Unknown block-hash extra-key category tag: {tag!r}")
+            groups[tag].append(tuple(entry))
+    return {tag: tuple(entries) for tag, entries in groups.items()}
+
+
+def _diff_extra_key_category(
+    left_entries: tuple[tuple[Any, ...], ...],
+    right_entries: tuple[tuple[Any, ...], ...],
+) -> ExtraKeyDiffStatus:
+    """Compare one category, distinguishing absence from inequality."""
+    if not left_entries and not right_entries:
+        return ExtraKeyDiffStatus.EQUAL
+    if not left_entries:
+        return ExtraKeyDiffStatus.MISSING_LEFT
+    if not right_entries:
+        return ExtraKeyDiffStatus.MISSING_RIGHT
+    # Compare as multisets so the order of entries (e.g. MM inputs in a block)
+    # does not affect the result.
+    if Counter(left_entries) == Counter(right_entries):
+        return ExtraKeyDiffStatus.EQUAL
+    return ExtraKeyDiffStatus.NOT_EQUAL
+
+
+def diff_block_hash_extra_keys(
+    left_extra_keys: tuple[Any, ...] | None,
+    right_extra_keys: tuple[Any, ...] | None,
+) -> ExtraKeysDiff:
+    """Explain per-category differences between two sets of block-hash keys.
+
+    Both inputs must be values already produced by
+    ``generate_block_hash_extra_keys`` (``None`` denotes a block with no extra
+    keys). This is a pure comparison over those values: it neither inspects
+    nor modifies requests, does not read prompt tokens, and does not perform
+    cache lookups. The returned ``ExtraKeysDiff`` reports only per-category
+    status — never LoRA names/paths, multimodal identifiers or offsets, cache
+    salts, or prompt-embedding hashes.
+
+    Args:
+        left_extra_keys: Extra keys generated for the first block/request.
+        right_extra_keys: Extra keys generated for the second block/request.
+
+    Returns:
+        An ``ExtraKeysDiff`` with one status per category (multimodal, LoRA,
+        cache salt, prompt embeddings): equal, missing on one side, or
+        unequal.
+
+    Raises:
+        ValueError: If an entry carries an unrecognized category tag.
+
+    """
+    left_groups = _group_extra_keys_by_category(left_extra_keys)
+    right_groups = _group_extra_keys_by_category(right_extra_keys)
+    return ExtraKeysDiff(
+        **{
+            name: _diff_extra_key_category(left_groups[tag], right_groups[tag])
+            for name, tag in _EXTRA_KEY_CATEGORIES
+        }
+    )
 
 
 def hash_block_tokens(

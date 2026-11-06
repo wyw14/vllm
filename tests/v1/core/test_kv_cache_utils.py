@@ -46,8 +46,11 @@ from vllm.v1.core.kv_cache_planning import (
 )
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    ExtraKeyDiffStatus,
+    ExtraKeysDiff,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    diff_block_hash_extra_keys,
     generate_block_hash_extra_keys,
     generate_scheduler_kv_cache_config,
     get_kv_cache_capacity,
@@ -1007,6 +1010,195 @@ def test_to_event_extra_keys_keeps_untagged_event_format():
     assert to_event_extra_keys([extra_keys, None]) == [event_keys, None]
     assert to_event_extra_keys([]) is None
     assert to_event_extra_keys(None) is None
+
+
+def test_diff_block_hash_extra_keys_identical_and_empty():
+    """Same keys on both sides, including empty sets, explain no changes."""
+    keys = (
+        ("lora", "adapter", "/path/to/lora"),
+        ("mm", "hash1", 0),
+        ("mm", "hash2", 10),
+        ("cache_salt", "salt"),
+        ("prompt_embeds", b"\x00" * 4),
+    )
+
+    for left, right in ((keys, keys), (None, None), ((), ()), (None, ())):
+        diff = diff_block_hash_extra_keys(left, right)
+        assert isinstance(diff, ExtraKeysDiff)
+        assert diff.is_equal
+        assert diff.changed_categories == ()
+        assert diff.explain() == ()
+        assert str(diff) == "all extra-key categories match"
+
+
+def test_diff_block_hash_extra_keys_distinguishes_missing_from_unequal():
+    """Each category independently reports absence vs inequality."""
+    digest_a = b"a" * 32
+    digest_b = b"b" * 32
+    cases = [
+        (
+            "lora",
+            (("lora", "adapter", "/path/a"),),
+            (("lora", "adapter", "/path/b"),),
+        ),
+        (
+            "multimodal",
+            (("mm", "hash1", 0),),
+            (("mm", "hash2", 0),),
+        ),
+        ("cache_salt", (("cache_salt", "salt-a"),), (("cache_salt", "salt-b"),)),
+        (
+            "prompt_embeds",
+            (("prompt_embeds", digest_a),),
+            (("prompt_embeds", digest_b),),
+        ),
+    ]
+
+    for category, left_entries, right_entries in cases:
+        missing_left = diff_block_hash_extra_keys(None, right_entries)
+        assert getattr(missing_left, category) is ExtraKeyDiffStatus.MISSING_LEFT
+        assert missing_left.changed_categories == (category,)
+
+        missing_right = diff_block_hash_extra_keys(left_entries, None)
+        assert getattr(missing_right, category) is ExtraKeyDiffStatus.MISSING_RIGHT
+        assert missing_right.changed_categories == (category,)
+
+        unequal = diff_block_hash_extra_keys(left_entries, right_entries)
+        assert getattr(unequal, category) is ExtraKeyDiffStatus.NOT_EQUAL
+        assert unequal.changed_categories == (category,)
+
+        # Every other category stays equal regardless of which side is empty.
+        for diff in (missing_left, missing_right, unequal):
+            assert all(
+                getattr(diff, other) is ExtraKeyDiffStatus.EQUAL
+                for other in ("multimodal", "lora", "cache_salt", "prompt_embeds")
+                if other != category
+            )
+
+
+def test_diff_block_hash_extra_keys_multiple_categories_change():
+    """One diff explains every changed category in a single pass."""
+    left = (
+        ("lora", "adapter-a", "/path/a"),
+        ("mm", "hash1", 0),
+        ("cache_salt", "salt-a"),
+    )
+    right = (
+        ("lora", "adapter-b", "/path/b"),
+        ("mm", "hash2", 0),
+        ("prompt_embeds", b"\x01" * 4),
+    )
+
+    diff = diff_block_hash_extra_keys(left, right)
+
+    assert not diff.is_equal
+    assert diff.lora is ExtraKeyDiffStatus.NOT_EQUAL
+    assert diff.multimodal is ExtraKeyDiffStatus.NOT_EQUAL
+    assert diff.cache_salt is ExtraKeyDiffStatus.MISSING_RIGHT
+    assert diff.prompt_embeds is ExtraKeyDiffStatus.MISSING_LEFT
+    assert set(diff.changed_categories) == {
+        "multimodal",
+        "lora",
+        "cache_salt",
+        "prompt_embeds",
+    }
+    assert str(diff) == (
+        "multimodal: not_equal; lora: not_equal; "
+        "cache_salt: missing_right; prompt_embeds: missing_left"
+    )
+
+
+def test_diff_block_hash_extra_keys_multimodal_order_and_offset():
+    """MM entry order is irrelevant, but a changed relative offset is not."""
+    left = (("mm", "hash1", 0), ("mm", "hash2", 10))
+    reordered = (("mm", "hash2", 10), ("mm", "hash1", 0))
+    assert diff_block_hash_extra_keys(left, reordered).is_equal
+
+    shifted = (("mm", "hash1", 2), ("mm", "hash2", 10))
+    diff = diff_block_hash_extra_keys(left, shifted)
+    assert diff.multimodal is ExtraKeyDiffStatus.NOT_EQUAL
+
+
+def test_diff_block_hash_extra_keys_is_symmetric():
+    """Swapping the two inputs swaps missing-left / missing-right statuses."""
+    left = (("lora", "a", "/a"), ("cache_salt", "salt-a"))
+    right = (("lora", "b", "/b"), ("prompt_embeds", b"\x01"))
+
+    forward = diff_block_hash_extra_keys(left, right)
+    backward = diff_block_hash_extra_keys(right, left)
+
+    assert forward.lora is backward.lora is ExtraKeyDiffStatus.NOT_EQUAL
+    assert forward.cache_salt is ExtraKeyDiffStatus.MISSING_RIGHT
+    assert backward.cache_salt is ExtraKeyDiffStatus.MISSING_LEFT
+    assert forward.prompt_embeds is ExtraKeyDiffStatus.MISSING_LEFT
+    assert backward.prompt_embeds is ExtraKeyDiffStatus.MISSING_RIGHT
+    assert forward.multimodal is backward.multimodal is ExtraKeyDiffStatus.EQUAL
+
+
+def test_diff_block_hash_extra_keys_does_not_leak_payloads():
+    """The explanation must not surface names, identifiers, salts, or digests."""
+    secret_path = "/super/secret/adapter-path"
+    secret_name = "secret-lora-name"
+    secret_identifier = "secret-mm-identifier"
+    secret_salt = "secret-cache-salt"
+    secret_digest = b"\xde\xad" * 16
+
+    left = (
+        ("lora", secret_name, secret_path),
+        ("mm", secret_identifier, 3),
+        ("cache_salt", secret_salt),
+        ("prompt_embeds", secret_digest),
+    )
+    right = (
+        ("lora", "other-name", "/other/path"),
+        ("mm", "other-identifier", 3),
+        ("cache_salt", "other-salt"),
+        ("prompt_embeds", b"\x00" * 32),
+    )
+
+    rendered = repr(diff_block_hash_extra_keys(left, right))
+    rendered += str(diff_block_hash_extra_keys(left, right))
+    rendered += " ".join(diff_block_hash_extra_keys(left, right).explain())
+
+    assert "secret" not in rendered
+    assert secret_digest.hex() not in rendered
+    assert repr(secret_digest) not in rendered
+
+
+def test_diff_block_hash_extra_keys_rejects_unknown_tag():
+    with pytest.raises(ValueError, match="extra-key category"):
+        diff_block_hash_extra_keys(None, (("unexpected", "value"),))
+
+
+def test_diff_block_hash_extra_keys_through_generator():
+    """Compare keys actually generated for two real requests."""
+    request_a = make_request(
+        "a",
+        list(range(6)),
+        mm_positions=[PlaceholderRange(offset=0, length=3)],
+        mm_hashes=["hash1"],
+        cache_salt="salt-a",
+    )
+    request_b = make_request(
+        "b",
+        list(range(6)),
+        mm_positions=[PlaceholderRange(offset=0, length=3)],
+        mm_hashes=["hash2"],
+        cache_salt="salt-b",
+    )
+
+    keys_a, _ = generate_block_hash_extra_keys(request_a, 0, 6, 0)
+    keys_b, _ = generate_block_hash_extra_keys(request_b, 0, 6, 0)
+
+    diff = diff_block_hash_extra_keys(keys_a, keys_b)
+    assert diff.multimodal is ExtraKeyDiffStatus.NOT_EQUAL
+    assert diff.cache_salt is ExtraKeyDiffStatus.NOT_EQUAL
+    assert diff.lora is ExtraKeyDiffStatus.EQUAL
+    assert diff.prompt_embeds is ExtraKeyDiffStatus.EQUAL
+    assert set(diff.changed_categories) == {"multimodal", "cache_salt"}
+
+    # A request compared against itself has identical extra keys.
+    assert diff_block_hash_extra_keys(keys_a, keys_a).is_equal
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
